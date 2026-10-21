@@ -57,7 +57,7 @@ button,input,select,textarea{font:inherit;color:inherit}
 .brand span{color:var(--accent)}
 .sync{flex:1;min-width:0;font-size:.78rem;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .sync b{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--muted);margin-right:6px;vertical-align:1px}
-.sync.cloud b{background:var(--good)} .sync.local b{background:var(--plan)} .sync.err b,.sync.memory b{background:var(--bad)} .sync.demo b{background:var(--plan)}
+.sync.cloud b,.sync.sheets b{background:var(--good)} .sync.local b{background:var(--plan)} .sync.err b,.sync.memory b{background:var(--bad)} .sync.demo b{background:var(--plan)}
 .iconbtn{border:1px solid var(--line);background:var(--surface-2);border-radius:10px;min-width:42px;height:42px;display:inline-flex;align-items:center;justify-content:center;cursor:pointer;padding:0 10px;gap:6px}
 .iconbtn svg{width:20px;height:20px}
 .tabs{display:flex;gap:4px;max-width:1100px;margin:0 auto;padding-left:var(--gutter-l);padding-right:var(--gutter-r)}
@@ -385,18 +385,22 @@ function touch(...keys) {
   const t = Date.now();
   for (const k of keys) { stamps[k] = t; dirty.add(k); saveLocal(k); }
   clearTimeout(flushTimer);
-  flushTimer = setTimeout(flushCloud, 700);
+  flushTimer = setTimeout(flushCloud, sheets && !cloud ? 1500 : 700);
 }
 function flushCloud() {
-  if (!cloud || demo || !dirty.size) return;
-  const keys = [...dirty]; dirty.clear();
+  if (demo || !dirty.size) return;
+  if (cloud) flushDb(); else if (sheets) flushSheets();
+}
+function flushDb() {
+  // snapshot bodies now, so a later switch into demo mode can't change what gets written
+  const bodies = [...dirty].map(k => [k, clone(docBody(k))]); dirty.clear();
   writeChain = writeChain.then(async () => {
     setSync("cloud", "Saving…");
-    for (const k of keys) {
-      try { await cloud.col.doc(k).set(docBody(k)); }
+    for (const [k, body] of bodies) {
+      try { await cloud.col.doc(k).set(body); }
       catch (e) {
+        if (e && e.code === "unavailable") { await new Promise(r => setTimeout(r, 800 + Math.random() * 800)); try { await cloud.col.doc(k).set(body); continue; } catch (e2) { } }
         dirty.add(k);
-        if (e && e.code === "unavailable") { await new Promise(r => setTimeout(r, 800 + Math.random() * 800)); try { await cloud.col.doc(k).set(docBody(k)); dirty.delete(k); continue; } catch (e2) { } }
         setSync("err", e && e.code === "quota_exceeded" ? "Cloud storage full — saved in this browser" : "Couldn’t sync — saved in this browser");
         return;
       }
@@ -404,25 +408,84 @@ function flushCloud() {
     setSync("cloud");
   });
 }
+
+/* ---- Google Sheets sync (standalone version only; settings stay on this device) ---- */
+let sheets = null;             // {url, key}
+try { sheets = JSON.parse(localStorage.getItem("ft:sheets") || "null"); } catch (e) { }
+let lastPull = 0;
+async function sheetsCall(action, extra = {}, cfg = sheets) {
+  const ctl = new AbortController(); const timer = setTimeout(() => ctl.abort(), 30000);
+  try {
+    const res = await fetch(cfg.url, { method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" }, body: JSON.stringify({ key: cfg.key, action, ...extra }), signal: ctl.signal, redirect: "follow" });
+    const r = await res.json();
+    if (!r.ok) throw Object.assign(new Error(r.error || "error"), { code: r.error });
+    return r;
+  } finally { clearTimeout(timer); }
+}
+function sheetsErrText(e) {
+  if (e && e.code === "bad_key") return "Google Sheet rejected the secret key — saved in this browser";
+  if (e && e.code === "not_set_up") return "Run setup in the Sheet's Apps Script first — saved in this browser";
+  return "Couldn’t reach Google Sheet — saved in this browser";
+}
+function withRealState(fn) {
+  if (!demo) return fn();
+  const shown = state; state = realState;
+  try { fn(); } finally { realState = state; state = shown; }
+}
+/** Apply remote documents that are newer than ours; optionally mark ours for upload where we're newer. */
+function mergeRemote(docs, markLocalNewer) {
+  let changed = false;
+  withRealState(() => {
+    for (const k in docs) {
+      const body = docs[k] || {}, remote = body.updatedAt || 0, local = stamps[k] || 0;
+      if (remote > local) { applyDoc(k, clone(body)); stamps[k] = remote; saveLocal(k); dirty.delete(k); changed = true; }
+      else if (markLocalNewer && local > remote) dirty.add(k);
+    }
+  });
+  if (changed && !demo) { applyTheme(); render(); }
+  return changed;
+}
+function flushSheets() {
+  const docs = {}; for (const k of dirty) docs[k] = clone(docBody(k));
+  const keys = Object.keys(docs); dirty.clear();
+  writeChain = writeChain.then(async () => {
+    setSync("sheets", "Saving to Google Sheet…");
+    try {
+      const r = await sheetsCall("push", { docs });
+      if (r.newer && Object.keys(r.newer).length) mergeRemote(r.newer, false);
+      setSync("sheets");
+    } catch (e) { keys.forEach(k => { if (!dirty.has(k)) dirty.add(k); }); setSync("err", sheetsErrText(e)); }
+  });
+}
+async function sheetsPull() {
+  if (!sheets || cloud) return;
+  lastPull = Date.now();
+  try {
+    setSync("sheets", "Loading from Google Sheet…");
+    const r = await sheetsCall("pull");
+    const docs = r.docs || {};
+    mergeRemote(docs, true);
+    for (const k of Object.keys(stamps)) if (!(k in docs)) dirty.add(k);
+    setSync("sheets");
+    flushCloud();
+  } catch (e) { setSync("err", sheetsErrText(e)); }
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && sheets && !cloud && !demo && Date.now() - lastPull > 30000) sheetsPull();
+});
 async function initCloud() {
   const use = window.claude && window.claude.use;
-  if (!use) { setSync(storageOK ? "local" : "memory"); return; }
+  if (!use) { if (sheets) sheetsPull(); else setSync(storageOK ? "local" : "memory"); return; }
   try {
     const [db, user] = await Promise.all([window.claude.use("db"), window.claude.use("user")]);
     const id = user ? await user.id() : null;
     if (!db || !id) { setSync(storageOK ? "local" : "memory"); return; }
     cloud = { col: db.collection("data/users/" + id) };
     const snap = await cloud.col.get();
-    const seen = new Set(); let changed = false;
-    for (const d of snap.docs) {
-      seen.add(d.id);
-      const body = d.data() || {}; const remote = body.updatedAt || 0; const local = stamps[d.id] || 0;
-      if (remote > local) { const was = demo; if (was) swapDemo(false); applyDoc(d.id, clone(body)); stamps[d.id] = remote; saveLocal(d.id); if (was) swapDemo(true); changed = true; }
-      else if (local > remote) dirty.add(d.id);
-    }
-    for (const k of Object.keys(stamps)) if (!seen.has(k)) dirty.add(k);
+    const docs = {}; for (const d of snap.docs) docs[d.id] = d.data() || {};
+    mergeRemote(docs, true);
+    for (const k of Object.keys(stamps)) if (!(k in docs)) dirty.add(k);
     setSync("cloud");
-    if (changed) render();
     flushCloud();
   } catch (e) {
     cloud = null;
@@ -433,7 +496,7 @@ function setSync(mode, msg) {
   sync = { mode, msg: msg || "" };
   const el = $("#sync"); if (!el) return;
   const text = demo ? "Demo data — nothing is saved" :
-    msg || ({ cloud: "Synced privately to your Claude account", local: "Saved in this browser only", memory: "Not saved — browser storage is blocked", err: "Sync problem" }[mode]);
+    msg || ({ cloud: "Synced privately to your Claude account", sheets: "Synced to your Google Sheet", local: "Saved in this browser only", memory: "Not saved — browser storage is blocked", err: "Sync problem" }[mode]);
   el.className = "sync " + (demo ? "demo" : mode);
   el.innerHTML = "<b></b>" + esc(text);
 }
@@ -834,6 +897,7 @@ function onboardingCard() {
     <div id="ob-sugg" class="note small"></div>
     <label class="row small"><input type="checkbox" id="ob-record" checked> Record this weight as today's weigh-in (${fmtDate(todayKey())})</label>
     <div class="row"><button class="btn primary" data-act="onboard">Confirm and start tracking</button><button class="btn ghost" data-act="demo-on">Explore with sample data first</button></div>
+    ${window.claude ? "" : `<p class="small muted">Already using FitTrack with Google Sheets on another device? <a href="#settings" data-act="tab" data-tab="settings">Connect your Sheet</a> instead of filling this in.</p>`}
   </section>`;
 }
 function obSuggestionText() {
@@ -1324,6 +1388,7 @@ function viewSettings() {
   const cal = num(P.calorieTarget);
   const chips = [75, 76, 77, 78].map(t => `<button class="chip" data-act="set-target" data-v="${t}" aria-pressed="${num(P.targetWeight) === t}">${t} kg</button>`).join("");
   const storageTxt = demo ? "You're viewing sample data. Nothing is saved." :
+    sheets && !cloud ? "Your entries are saved in this browser and synced to your own Google Sheet (in your Google Drive). Any phone or computer you connect to the same Sheet shows the same data. Keep the Sheet's web app URL and secret key private, because together they give access to your data." :
     sync.mode === "cloud" || sync.mode === "err" ? "Your entries are saved in this browser and synced to a private space tied to your Claude account, so they appear on your phone and computer when you open this page signed in. That private space can't be read by anyone else who opens this page, including if you share it." :
     sync.mode === "local" ? "Your entries are saved only in this browser on this device. They are not synced. Clearing site data or using a private window will remove them, so make a backup now and then." :
     "This browser is blocking storage, so entries will be lost when you close the page. Use backups.";
@@ -1368,6 +1433,7 @@ function viewSettings() {
       <p class="tiny muted">Times are IST. Reminders appear on the Today screen when something isn't logged by that time. This page can't send phone notifications.</p>
       <div class="row"><button class="btn" data-act="r-save">Save reminders</button></div>
     </section>
+    ${window.claude ? "" : sheetsSection()}
     <section class="card stack"><h2>Your data and privacy</h2>
       <p class="small">${storageTxt}</p>
       <div class="row">
@@ -1602,12 +1668,68 @@ const ACT = {
   "delete-all": async () => {
     if ($("#del-confirm").value.trim() !== "DELETE") { $("#del-confirm").focus(); toast("Type DELETE to confirm"); return; }
     const keys = allDocKeys();
-    try { for (const k of Object.keys(localStorage)) if (k.startsWith("ft:")) localStorage.removeItem(k); } catch (e) { }
     if (cloud) { try { const snap = await cloud.col.get(); for (const d of snap.docs) await cloud.col.doc(d.id).delete(); for (const k of keys) await cloud.col.doc(k).delete(); } catch (e) { toast("Couldn't reach cloud storage; try again"); return; } }
-    for (const k of Object.keys(stamps)) delete stamps[k]; dirty.clear();
+    if (sheets && !cloud) { try { await sheetsCall("deleteAll"); } catch (e) { toast("Couldn't reach your Google Sheet; nothing was deleted"); return; } sheets = null; }
+    try { for (const k of Object.keys(localStorage)) if (k.startsWith("ft:")) localStorage.removeItem(k); } catch (e) { }
+    for (const k of Object.keys(stamps)) delete stamps[k]; dirty.clear(); setSync(storageOK ? "local" : "memory");
     state = defaultState(); ui.tab = "dashboard"; applyTheme(); toast("All FitTrack data deleted"); render();
   },
+  "sh-connect": async () => {
+    const url = $("#sh-url").value.trim(), key = $("#sh-key").value.trim(), msg = $("#sh-msg");
+    if (!/^https:\/\/script\.google\.com\/macros\/s\/[\w-]+\/exec$/.test(url)) { msg.innerHTML = '<div class="note bad small">Paste the web app URL from Apps Script. It starts with https://script.google.com/macros/s/ and ends with /exec.</div>'; return; }
+    if (key.length < 16) { msg.innerHTML = '<div class="note bad small">Paste the secret key shown in the Apps Script log after running setup.</div>'; return; }
+    const cfg = { url, key };
+    msg.innerHTML = '<div class="note small">Connecting to your Google Sheet…</div>';
+    let r;
+    try { await sheetsCall("ping", {}, cfg); r = await sheetsCall("pull", {}, cfg); }
+    catch (e) {
+      const why = e && e.code === "bad_key" ? "The secret key doesn't match. Copy it again from the Apps Script log." : e && e.code === "not_set_up" ? "Run the setup function in Apps Script first." : "Couldn't reach the Sheet. Check the URL, and that the deployment's \"Who has access\" is set to Anyone.";
+      msg.innerHTML = `<div class="note bad small">${esc(why)}</div>`; return;
+    }
+    ui.shPending = { cfg, docs: r.docs || {} };
+    const remoteHas = Object.keys(ui.shPending.docs).length > 0;
+    const localHas = state.profile.confirmed || state.weights.length || Object.keys(state.food).length || Object.keys(state.workouts).length;
+    if (remoteHas && localHas) {
+      msg.innerHTML = `<div class="note warn stack small"><span>Both this device and your Sheet already have FitTrack data. Which should this device use?</span><div class="row"><button class="btn sm primary" data-act="sh-finish" data-mode="remote">Use the Sheet's data here</button><button class="btn sm" data-act="sh-finish" data-mode="merge">Combine (newest changes win)</button></div><span class="tiny muted">"Use the Sheet's data" replaces what's on this device. "Combine" keeps whichever copy was changed most recently for each month of records.</span></div>`;
+      return;
+    }
+    finishSheets(remoteHas ? "remote" : "merge");
+  },
+  "sh-finish": el => finishSheets(el.dataset.mode),
+  "sh-sync": () => { sheetsPull(); },
+  "sh-off": () => {
+    sheets = null; try { localStorage.removeItem("ft:sheets"); } catch (e) { }
+    setSync(storageOK ? "local" : "memory"); toast("Disconnected. Data stays on this device and in your Sheet."); render();
+  },
 };
+function finishSheets(mode) {
+  const p = ui.shPending; if (!p || demo) return;
+  ui.shPending = null;
+  sheets = p.cfg; try { localStorage.setItem("ft:sheets", JSON.stringify(sheets)); } catch (e) { }
+  if (mode === "remote") {
+    for (const k of Object.keys(stamps)) { delete stamps[k]; try { localStorage.removeItem("ft:doc:" + k); } catch (e) { } }
+    dirty.clear(); state = defaultState();
+  }
+  mergeRemote(p.docs, true);
+  for (const k of allDocKeys()) if (!(k in p.docs) && stamps[k]) dirty.add(k);
+  lastPull = Date.now(); setSync("sheets"); flushCloud();
+  toast("Connected to your Google Sheet"); render();
+}
+function sheetsSection() {
+  if (sheets) return `<section class="card stack"><h2>Google Sheets sync</h2>
+    <p class="small"><span class="pill good">Connected</span> Changes save to your Google Sheet a moment after you make them, and FitTrack loads newer data from it each time you open the app.</p>
+    <p class="tiny muted" style="overflow-wrap:anywhere">${esc(sheets.url.replace(/\/macros\/s\/(.{6}).*\/exec$/, "/macros/s/$1…/exec"))}</p>
+    <div class="row"><button class="btn sm" data-act="sh-sync" ${demo ? "disabled" : ""}>Sync now</button><button class="btn sm ghost" data-act="sh-off">Disconnect this device</button></div>
+  </section>`;
+  return `<section class="card stack"><h2>Google Sheets sync</h2>
+    <p class="small">Save your entries to a Google Sheet in your own Drive so your phone and computer share the same data. Set up the Sheet's script first (see the FitTrack setup guide), then paste its details here.</p>
+    <label class="field"><span>Web app URL</span><input id="sh-url" inputmode="url" autocomplete="off" placeholder="https://script.google.com/macros/s/…/exec"></label>
+    <label class="field"><span>Secret key</span><input id="sh-key" type="password" autocomplete="off" placeholder="From the Apps Script log"></label>
+    <div id="sh-msg"></div>
+    <div class="row"><button class="btn primary" data-act="sh-connect" ${demo ? "disabled" : ""}>Connect</button></div>
+    <p class="tiny muted">The URL and key are stored only in this browser, never in the app's code on GitHub.</p>
+  </section>`;
+}
 function newEx(name, date) {
   const prev = exerciseHistory(name, date).pop();
   return { id: uid(), name, sets: prev ? prev.sets.map(s => ({ reps: s.reps, kg: s.kg })) : [{ reps: null, kg: null }] };
