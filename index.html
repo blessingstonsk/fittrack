@@ -970,9 +970,9 @@ function viewDashboard() {
       <section class="card stack">
         <div class="row between"><h2>Today's workout</h2>${st ? `<span class="pill ${st[0]}">${st[1]}</span>` : plan.rest ? '<span class="pill">Rest day</span>' : '<span class="pill">Not logged</span>'}</div>
         <p style="font-family:var(--font-display);font-size:1.5rem;font-weight:600">${esc(plan.label)}</p>
-        ${plan.override ? `<p class="small muted">${plan.movedFrom ? `Moved from ${fmtDate(plan.movedFrom)}.` : "Changed from your usual schedule."}</p>` : ""}
+        ${plan.override ? `<p class="small muted">${planNote(plan)}</p>` : ""}
         ${!plan.rest && plan.exercises.length ? `<p class="small muted">${esc(plan.exercises.join(" · "))}</p>` : ""}
-        <div class="row"><button class="btn sm" data-act="add-workout">${log ? "Open log" : plan.rest ? "Log an extra session" : "Start logging"}</button></div>
+        <div class="row"><button class="btn sm" data-act="add-workout">${log ? "Open log" : plan.rest ? "Log an extra session" : "Start logging"}</button><button class="btn sm" data-act="change-wk-today">Change workout</button></div>
       </section>
       <section class="card stack">
         <h2>This week so far</h2>
@@ -1258,9 +1258,11 @@ function viewWorkouts() {
     <div class="grid two">
       <section class="card stack">
         <div class="row between"><div><div class="label">${fmtDay(d)} · planned</div><p style="font-family:var(--font-display);font-size:1.6rem;font-weight:600">${esc(plan.label)}</p></div>${plan.rest ? '<span class="pill">Rest day</span>' : ""}</div>
-        ${plan.override ? `<p class="small muted">${plan.movedFrom ? `Moved here from ${fmtDate(plan.movedFrom)}.` : plan.movedTo ? `Moved to ${fmtDate(plan.movedTo)}.` : "Changed from your weekly schedule."}</p>` : ""}
+        ${plan.override ? `<p class="small muted">${planNote(plan)}</p>` : ""}
+        ${!plan.rest && plan.exercises.length ? `<p class="small muted">${esc(plan.exercises.join(" · "))}</p>` : ""}
         <div class="row">
-          ${!plan.rest ? `<button class="btn sm" data-act="resched">Reschedule</button><button class="btn sm" data-act="make-rest">Make rest day</button>` : ""}
+          <button class="btn sm primary" data-act="change-wk">Change ${d === today ? "today's" : "this day's"} workout</button>
+          ${!plan.rest ? `<button class="btn sm" data-act="resched">Move to another day</button>` : ""}
           ${plan.override ? `<button class="btn sm ghost" data-act="reset-plan">Reset to weekly schedule</button>` : ""}
         </div>
         ${d > today ? '<p class="small muted">This day is in the future. You can plan it, and log it on the day.</p>' : `
@@ -1325,6 +1327,47 @@ function reschedSheet() {
     <label class="field"><span>New date</span><input type="date" id="rs-date" min="${addDays(todayKey(), -7)}" value="${addDays(d, 1)}"></label>
     <p class="small muted">${fmtDay(d)} becomes a rest day. Whatever was planned on the new date is replaced; you can reset either day to the weekly schedule later.</p>
     <div class="row"><button class="btn primary" data-act="rs-save">Move workout</button><button class="btn" data-act="close-sheet">Cancel</button></div></div>`);
+}
+function planNote(p) {
+  if (p.movedFrom) return `Moved here from ${fmtDay(p.movedFrom)}.`;
+  if (p.movedTo) return `Moved to ${fmtDay(p.movedTo)}.`;
+  if (p.shifted) return "Shifted along with this week's schedule.";
+  return "Changed from your weekly schedule.";
+}
+const isDone = d => ["done", "partial"].includes((state.workouts[d] || {}).status);
+/** The most recent earlier day this week whose planned workout wasn't done and hasn't been moved. */
+function missedThisWeek(d) {
+  for (let x = addDays(d, -1); x >= weekStart(d); x = addDays(x, -1)) {
+    const p = plannedFor(x);
+    if (!p.rest && !p.movedTo && !isDone(x)) return { date: x, plan: p };
+  }
+  return null;
+}
+const planOf = p => ({ label: p.label, rest: !!p.rest, exercises: [...(p.exercises || [])] });
+/** Put a workout on a day, keeping that day's log title in step. */
+function setPlan(day, plan) {
+  state.overrides[day] = plan;
+  const l = state.workouts[day];
+  if (l && !plan.rest) { l.label = plan.label; touch(docKeyWk(day)); }
+}
+function changeWorkoutSheet() {
+  const d = ui.wkDate, cur = plannedFor(d), missed = cur.movedFrom ? null : missedThisWeek(d);
+  const weekEnd = addDays(weekStart(d), 6);
+  openSheet(d === todayKey() ? "Change today's workout" : `Change workout for ${fmtDay(d)}`, `<div class="stack">
+    <p class="small muted">Planned now: <b>${esc(cur.label)}</b>. This changes ${fmtDay(d)} only; your weekly schedule stays the same.</p>
+    ${missed ? `<div class="note stack">
+      <span>${DOW_NAMES[DOW_KEYS[dow(missed.date)]]}'s <b>${esc(missed.plan.label)}</b> (${fmtDate(missed.date)}) wasn't done. Do it ${d === todayKey() ? "today" : "on " + fmtDay(d)} instead?</span>
+      ${d < weekEnd ? `<label class="row small" style="flex-wrap:nowrap;align-items:flex-start"><input type="checkbox" id="cw-shift" style="margin-top:3px;flex:none"> Also push the rest of this week back (${esc(cur.label)} moves to ${fmtDay(addDays(d, 1))}, and so on to Sunday)</label>` : ""}
+      <div class="row"><button class="btn primary" data-act="cw-missed" data-from="${missed.date}">Do ${esc(missed.plan.label)} ${d === todayKey() ? "today" : "on this day"}</button></div>
+      <span class="tiny muted">${fmtDay(missed.date)} will show as a rest day.</span></div>` : ""}
+    <div><div class="label" style="margin-bottom:6px">${missed ? "Or pick any workout" : "Pick a workout"}</div>
+    <div class="foodpick">${WEEK_ORDER.filter(k => !state.schedule[k].rest).map(k => { const s = state.schedule[k]; return `<button data-act="cw-pick" data-k="${k}"><span class="main"><b>${esc(s.label)}</b><br><span class="small muted">Usually ${DOW_NAMES[k]} · ${plural(s.exercises.length, "exercise")}</span></span>${s.label === cur.label ? '<span class="pill acc">Current</span>' : ""}</button>`; }).join("")}</div></div>
+    <details><summary>Custom workout</summary><div class="stack" style="margin-top:10px">
+      <label class="field"><span>Workout name</span><input id="cw-label" value="${cur.rest ? "" : esc(cur.label)}" placeholder="e.g. Upper body"></label>
+      <label class="field"><span>Exercises (one per line)</span><textarea id="cw-ex">${esc((cur.exercises || []).join("\n"))}</textarea></label>
+      <div class="row"><button class="btn primary" data-act="cw-custom">Save for ${fmtDay(d)}</button></div></div></details>
+    <div class="row">${!cur.rest ? `<button class="btn" data-act="cw-rest">Make it a rest day</button>` : ""}${cur.override ? `<button class="btn ghost" data-act="cw-reset">Back to weekly schedule</button>` : ""}</div>
+  </div>`);
 }
 
 /* ---- insights ---- */
@@ -1640,8 +1683,36 @@ const ACT = {
     state.overrides[from] = { label: "Rest (workout moved)", rest: true, exercises: [], movedTo: to };
     touch("core"); closeSheet(); ui.wkDate = to; toast(`Moved to ${fmtDay(to)}`); render();
   },
+  "change-wk": () => changeWorkoutSheet(),
+  "change-wk-today": () => { ui.tab = "workouts"; ui.wkDate = todayKey(); render(); changeWorkoutSheet(); },
+  "cw-missed": el => {
+    const d = ui.wkDate, from = el.dataset.from, shift = $("#cw-shift") && $("#cw-shift").checked;
+    const gap = dayNum(d) - dayNum(from), weekEnd = addDays(weekStart(d), 6);
+    const snap = {}; for (let x = from; x <= weekEnd; x = addDays(x, 1)) snap[x] = planOf(plannedFor(x));
+    if (shift) {
+      // every day from here to Sunday takes the workout planned `gap` days earlier
+      for (let x = addDays(d, 1); x <= weekEnd; x = addDays(x, 1)) if (!isDone(x)) setPlan(x, { ...snap[addDays(x, -gap)], shifted: true });
+      for (let x = addDays(from, 1); x < d; x = addDays(x, 1)) if (!isDone(x)) setPlan(x, { label: "Rest (schedule shifted)", rest: true, exercises: [] });
+    }
+    setPlan(d, { ...snap[from], rest: false, movedFrom: from });
+    setPlan(from, { label: "Rest (workout moved)", rest: true, exercises: [], movedTo: d });
+    touch("core"); closeSheet(); toast(`${snap[from].label} is now on ${fmtDay(d)}`); render();
+  },
+  "cw-pick": el => { const s = state.schedule[el.dataset.k]; setPlan(ui.wkDate, planOf(s)); touch("core"); closeSheet(); toast(`${fmtDay(ui.wkDate)}: ${s.label}`); render(); },
+  "cw-custom": () => {
+    const label = $("#cw-label").value.trim(); if (!label) { $("#cw-label").focus(); return; }
+    setPlan(ui.wkDate, { label, rest: false, exercises: $("#cw-ex").value.split(/\n|,/).map(s => s.trim()).filter(Boolean) });
+    touch("core"); closeSheet(); toast("Workout updated"); render();
+  },
+  "cw-rest": () => { ACT["make-rest"](); closeSheet(); },
+  "cw-reset": () => { ACT["reset-plan"](); closeSheet(); },
   "make-rest": () => { state.overrides[ui.wkDate] = { label: "Rest day", rest: true, exercises: [] }; touch("core"); render(); },
-  "reset-plan": () => { delete state.overrides[ui.wkDate]; touch("core"); render(); },
+  "reset-plan": () => {
+    const d = ui.wkDate; delete state.overrides[d];
+    const l = state.workouts[d], p = plannedFor(d);
+    if (l && !p.rest) { l.label = p.label; touch(docKeyWk(d)); }
+    touch("core"); render();
+  },
   "sch-save": () => {
     for (const k of WEEK_ORDER) state.schedule[k] = { label: $("#sch-label-" + k).value.trim() || (($("#sch-rest-" + k).checked) ? "Rest" : "Workout"), rest: $("#sch-rest-" + k).checked, exercises: $("#sch-ex-" + k).value.split(/\n|,/).map(s => s.trim()).filter(Boolean) };
     touch("core"); toast("Schedule saved"); render();
